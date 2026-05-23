@@ -1,7 +1,7 @@
 openapi: 3.0.3
 info:
   title: Task Planning API
-  description: REST API for laboratory work 02, variant 10, task planning.
+  description: REST API for laboratory work 04, variant 10, task planning with MongoDB.
   version: 1.0.0
 servers:
   - url: http://localhost:8080
