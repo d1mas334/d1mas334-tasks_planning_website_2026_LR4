@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <cctype>
 #include <cstdint>
 #include <optional>
@@ -12,27 +13,42 @@
 #include <userver/components/component_base.hpp>
 #include <userver/components/component_context.hpp>
 #include <userver/components/minimal_server_component_list.hpp>
+#include <userver/clients/dns/component.hpp>
+#include <userver/formats/bson/document.hpp>
+#include <userver/formats/bson/types.hpp>
+#include <userver/formats/bson/value.hpp>
+#include <userver/formats/bson/value_builder.hpp>
 #include <userver/formats/common/type.hpp>
 #include <userver/formats/json.hpp>
 #include <userver/formats/json/value_builder.hpp>
+#include <userver/logging/log.hpp>
 #include <userver/server/handlers/http_handler_base.hpp>
 #include <userver/server/http/http_request.hpp>
 #include <userver/server/http/http_status.hpp>
+#include <userver/storages/mongo/collection.hpp>
+#include <userver/storages/mongo/component.hpp>
+#include <userver/storages/mongo/options.hpp>
+#include <userver/storages/mongo/pool.hpp>
 #include <userver/storages/postgres/cluster.hpp>
 #include <userver/storages/postgres/component.hpp>
 #include <userver/storages/postgres/result_set.hpp>
 #include <userver/testsuite/testsuite_support.hpp>
+#include <userver/utils/datetime.hpp>
 #include <userver/utils/daemon_run.hpp>
 
 namespace task_planning {
 
+namespace bson = userver::formats::bson;
 namespace components = userver::components;
 namespace formats = userver::formats;
 namespace handlers = userver::server::handlers;
 namespace http = userver::server::http;
 namespace json = userver::formats::json;
+namespace mongo = userver::storages::mongo;
+namespace mongo_options = userver::storages::mongo::options;
 namespace postgres = userver::storages::postgres;
 namespace server = userver::server;
+namespace datetime = userver::utils::datetime;
 
 struct User {
   std::int64_t id{};
@@ -286,6 +302,25 @@ class PostgresStorage final : public components::ComponentBase {
     return tasks;
   }
 
+  std::optional<Task> FindTask(std::int64_t goal_id,
+                               std::int64_t task_id) const {
+    const auto result = pg_cluster_->Execute(
+        postgres::ClusterHostType::kMaster,
+        R"(
+          SELECT id, goal_id, title, description, assignee_id, author_id,
+                 status, COALESCE(due_date::text, '') AS due_date
+          FROM tasks
+          WHERE goal_id = $1 AND id = $2
+        )",
+        goal_id, task_id);
+
+    if (result.IsEmpty()) {
+      return std::nullopt;
+    }
+
+    return RowToTask(result[0]);
+  }
+
   std::optional<Task> UpdateTaskStatus(std::int64_t goal_id,
                                        std::int64_t task_id,
                                        std::string status) const {
@@ -340,6 +375,109 @@ class PostgresStorage final : public components::ComponentBase {
   postgres::ClusterPtr pg_cluster_;
 };
 
+bson::Document ExtractDocument(bson::ValueBuilder builder) {
+  return bson::Document{builder.ExtractValue()};
+}
+
+class MongoStorage final : public components::ComponentBase {
+ public:
+  static constexpr std::string_view kName = "mongo-storage";
+
+  MongoStorage(const components::ComponentConfig& config,
+               const components::ComponentContext& context)
+      : ComponentBase(config, context),
+        pool_(context.FindComponent<components::Mongo>("task-planning-mongo")
+                  .GetPool()),
+        task_comments_(pool_->GetCollection("task_comments")),
+        task_activity_(pool_->GetCollection("task_activity")) {}
+
+  bson::Document CreateTaskComment(std::int64_t goal_id, std::int64_t task_id,
+                                   const User& author,
+                                   const std::string& text,
+                                   const std::vector<std::string>& tags) {
+    const auto now = datetime::Now();
+
+    bson::ValueBuilder document;
+    document["_id"] = bson::Oid{};
+    document["taskId"] = task_id;
+    document["goalId"] = goal_id;
+    document["author"]["userId"] = author.id;
+    document["author"]["login"] = author.login;
+    document["author"]["displayName"] =
+        author.first_name + " " + author.last_name;
+    document["text"] = text;
+    document["tags"] = BuildTags(tags);
+    document["createdAt"] = now;
+    document["updatedAt"] = now;
+
+    auto extracted = ExtractDocument(std::move(document));
+    task_comments_.InsertOne(extracted);
+    return extracted;
+  }
+
+  std::vector<bson::Document> ListTaskComments(std::int64_t goal_id,
+                                               std::int64_t task_id) const {
+    auto cursor = task_comments_.Find(
+        BuildTaskFilter(goal_id, task_id),
+        mongo_options::Sort{{"createdAt", mongo_options::Sort::kAscending}});
+
+    std::vector<bson::Document> documents;
+    for (const auto& document : cursor) {
+      documents.push_back(document);
+    }
+    return documents;
+  }
+
+  void AddStatusChangedActivity(std::int64_t goal_id, std::int64_t task_id,
+                                std::int64_t actor_id,
+                                const std::string& new_status) {
+    bson::ValueBuilder document;
+    document["_id"] = bson::Oid{};
+    document["taskId"] = task_id;
+    document["goalId"] = goal_id;
+    document["type"] = "status_changed";
+    document["actor"]["userId"] = actor_id;
+    document["payload"]["newStatus"] = new_status;
+    document["createdAt"] = datetime::Now();
+
+    task_activity_.InsertOne(ExtractDocument(std::move(document)));
+  }
+
+  std::vector<bson::Document> ListTaskActivity(std::int64_t goal_id,
+                                               std::int64_t task_id) const {
+    auto cursor = task_activity_.Find(
+        BuildTaskFilter(goal_id, task_id),
+        mongo_options::Sort{{"createdAt", mongo_options::Sort::kAscending}});
+
+    std::vector<bson::Document> documents;
+    for (const auto& document : cursor) {
+      documents.push_back(document);
+    }
+    return documents;
+  }
+
+ private:
+  static bson::Value BuildTags(const std::vector<std::string>& tags) {
+    bson::ValueBuilder builder(formats::common::Type::kArray);
+    for (const auto& tag : tags) {
+      builder.PushBack(bson::ValueBuilder{tag});
+    }
+    return builder.ExtractValue();
+  }
+
+  static bson::Document BuildTaskFilter(std::int64_t goal_id,
+                                        std::int64_t task_id) {
+    bson::ValueBuilder filter;
+    filter["goalId"] = goal_id;
+    filter["taskId"] = task_id;
+    return ExtractDocument(std::move(filter));
+  }
+
+  mongo::PoolPtr pool_;
+  mongo::Collection task_comments_;
+  mongo::Collection task_activity_;
+};
+
 struct ApiError {
   http::HttpStatus status;
   std::string message;
@@ -383,6 +521,121 @@ json::ValueBuilder BuildTask(const Task& task) {
   builder["authorId"] = task.author_id;
   builder["status"] = task.status;
   builder["dueDate"] = task.due_date;
+  return builder;
+}
+
+std::int64_t ReadBsonInt64(const bson::Value& value) {
+  if (value.IsMissing() || value.IsNull()) {
+    return 0;
+  }
+  if (value.IsInt64()) {
+    return value.As<std::int64_t>();
+  }
+  if (value.IsInt32() || value.IsInt()) {
+    return value.As<int>();
+  }
+  return value.ConvertTo<std::int64_t>();
+}
+
+std::string ReadBsonString(const bson::Value& value) {
+  if (value.IsMissing() || value.IsNull()) {
+    return {};
+  }
+  return value.As<std::string>();
+}
+
+std::string ReadBsonDateTime(const bson::Value& value) {
+  if (value.IsMissing() || value.IsNull()) {
+    return {};
+  }
+  return datetime::UtcTimestring(value.As<std::chrono::system_clock::time_point>(),
+                                 datetime::kIsoFormat);
+}
+
+json::ValueBuilder BuildJsonFromBsonValue(const bson::Value& value) {
+  if (value.IsMissing() || value.IsNull()) {
+    return json::ValueBuilder{nullptr};
+  }
+  if (value.IsBool()) {
+    return json::ValueBuilder{value.As<bool>()};
+  }
+  if (value.IsInt64()) {
+    return json::ValueBuilder{value.As<std::int64_t>()};
+  }
+  if (value.IsInt32() || value.IsInt()) {
+    return json::ValueBuilder{value.As<int>()};
+  }
+  if (value.IsUInt64()) {
+    return json::ValueBuilder{static_cast<std::int64_t>(value.As<std::uint64_t>())};
+  }
+  if (value.IsDouble()) {
+    return json::ValueBuilder{value.As<double>()};
+  }
+  if (value.IsString()) {
+    return json::ValueBuilder{value.As<std::string>()};
+  }
+  if (value.IsDateTime()) {
+    return json::ValueBuilder{ReadBsonDateTime(value)};
+  }
+  if (value.IsOid()) {
+    return json::ValueBuilder{value.As<bson::Oid>().ToString()};
+  }
+  if (value.IsArray()) {
+    json::ValueBuilder array(formats::common::Type::kArray);
+    for (const auto& item : value) {
+      array.PushBack(BuildJsonFromBsonValue(item));
+    }
+    return array;
+  }
+  if (value.IsObject()) {
+    json::ValueBuilder object;
+    for (auto it = value.begin(); it != value.end(); ++it) {
+      object[it.GetName()] = BuildJsonFromBsonValue(*it);
+    }
+    return object;
+  }
+
+  return json::ValueBuilder{nullptr};
+}
+
+json::ValueBuilder BuildEmbeddedUser(const bson::Value& value) {
+  json::ValueBuilder builder;
+  builder["userId"] = ReadBsonInt64(value["userId"]);
+  builder["login"] = ReadBsonString(value["login"]);
+  builder["displayName"] = ReadBsonString(value["displayName"]);
+  return builder;
+}
+
+json::ValueBuilder BuildTaskComment(const bson::Document& document) {
+  json::ValueBuilder builder;
+  builder["id"] = document["_id"].As<bson::Oid>().ToString();
+  builder["taskId"] = ReadBsonInt64(document["taskId"]);
+  builder["goalId"] = ReadBsonInt64(document["goalId"]);
+  builder["author"] = BuildEmbeddedUser(document["author"]);
+  builder["text"] = ReadBsonString(document["text"]);
+  builder["tags"] = document["tags"].IsMissing()
+                        ? json::ValueBuilder{formats::common::Type::kArray}
+                        : BuildJsonFromBsonValue(document["tags"]);
+  builder["createdAt"] = ReadBsonDateTime(document["createdAt"]);
+  builder["updatedAt"] = ReadBsonDateTime(document["updatedAt"]);
+  return builder;
+}
+
+json::ValueBuilder BuildTaskActivity(const bson::Document& document) {
+  json::ValueBuilder builder;
+  builder["id"] = document["_id"].As<bson::Oid>().ToString();
+  builder["taskId"] = ReadBsonInt64(document["taskId"]);
+  builder["goalId"] = ReadBsonInt64(document["goalId"]);
+  builder["type"] = ReadBsonString(document["type"]);
+  builder["actor"] = BuildEmbeddedUser(document["actor"]);
+  builder["payload"] = BuildJsonFromBsonValue(document["payload"]);
+  builder["visibleTo"] = document["visibleTo"].IsMissing()
+                             ? json::ValueBuilder{formats::common::Type::kArray}
+                             : BuildJsonFromBsonValue(document["visibleTo"]);
+  builder["important"] = document["important"].IsMissing()
+                             ? false
+                             : document["important"].As<bool>();
+  builder["createdAt"] = ReadBsonDateTime(document["createdAt"]);
   return builder;
 }
 
@@ -442,6 +695,42 @@ std::string GetOptionalString(const json::Value& body,
                    std::string{field_name} + " must be a string"};
   }
   return value.As<std::string>();
+}
+
+std::string GetRequiredStringMaxLength(const json::Value& body,
+                                       std::string_view field_name,
+                                       std::size_t max_length) {
+  auto value = GetRequiredString(body, field_name);
+  if (value.size() > max_length) {
+    throw ApiError{http::HttpStatus::kBadRequest,
+                   std::string{field_name} + " must be at most " +
+                       std::to_string(max_length) + " characters"};
+  }
+  return value;
+}
+
+std::vector<std::string> GetOptionalStringArray(const json::Value& body,
+                                                std::string_view field_name) {
+  const auto value = body[std::string{field_name}];
+  if (value.IsMissing()) {
+    return {};
+  }
+  if (!value.IsArray()) {
+    throw ApiError{http::HttpStatus::kBadRequest,
+                   std::string{field_name} + " must be an array of strings"};
+  }
+
+  std::vector<std::string> result;
+  result.reserve(value.GetSize());
+  for (std::uint32_t index = 0; index < value.GetSize(); ++index) {
+    const auto item = value[index];
+    if (!item.IsString()) {
+      throw ApiError{http::HttpStatus::kBadRequest,
+                     std::string{field_name} + " must be an array of strings"};
+    }
+    result.push_back(item.As<std::string>());
+  }
+  return result;
 }
 
 std::int64_t GetRequiredPositiveId(const json::Value& body,
@@ -509,7 +798,8 @@ class ApiHandlerBase : public handlers::HttpHandlerBase {
   ApiHandlerBase(const components::ComponentConfig& config,
                  const components::ComponentContext& context)
       : HttpHandlerBase(config, context),
-        storage_(context.FindComponent<PostgresStorage>()) {}
+        storage_(context.FindComponent<PostgresStorage>()),
+        mongo_storage_(context.FindComponent<MongoStorage>()) {}
 
   std::string HandleRequestThrow(
       const http::HttpRequest& request,
@@ -546,6 +836,7 @@ class ApiHandlerBase : public handlers::HttpHandlerBase {
   }
 
   PostgresStorage& storage_;
+  MongoStorage& mongo_storage_;
 };
 
 class PingHandler final : public ApiHandlerBase {
@@ -765,7 +1056,7 @@ class TaskStatusHandler final : public ApiHandlerBase {
   std::string HandleApiRequest(
       const http::HttpRequest& request,
       server::request::RequestContext&) const override {
-    RequireAuth(request);
+    const auto actor_id = RequireAuth(request);
 
     const auto goal_id = ParsePositiveId(request.GetPathArg("goalId"), "goalId");
     const auto task_id = ParsePositiveId(request.GetPathArg("taskId"), "taskId");
@@ -785,7 +1076,85 @@ class TaskStatusHandler final : public ApiHandlerBase {
       throw ApiError{http::HttpStatus::kNotFound, "task not found"};
     }
 
+    mongo_storage_.AddStatusChangedActivity(goal_id, task_id, actor_id, status);
+
     return MakeJsonResponse(request, http::HttpStatus::kOk, BuildTask(*task));
+  }
+};
+
+class TaskCommentsHandler final : public ApiHandlerBase {
+ public:
+  static constexpr std::string_view kName = "handler-task-comments";
+  using ApiHandlerBase::ApiHandlerBase;
+
+ private:
+  std::string HandleApiRequest(
+      const http::HttpRequest& request,
+      server::request::RequestContext&) const override {
+    const auto author_id = RequireAuth(request);
+    const auto goal_id = ParsePositiveId(request.GetPathArg("goalId"), "goalId");
+    const auto task_id = ParsePositiveId(request.GetPathArg("taskId"), "taskId");
+
+    if (!storage_.FindGoalById(goal_id).has_value()) {
+      throw ApiError{http::HttpStatus::kNotFound, "goal not found"};
+    }
+    if (!storage_.FindTask(goal_id, task_id).has_value()) {
+      throw ApiError{http::HttpStatus::kNotFound, "task not found"};
+    }
+
+    if (request.GetMethod() == http::HttpMethod::kGet) {
+      json::ValueBuilder comments(formats::common::Type::kArray);
+      for (const auto& comment :
+           mongo_storage_.ListTaskComments(goal_id, task_id)) {
+        comments.PushBack(BuildTaskComment(comment));
+      }
+      return MakeJsonResponse(request, http::HttpStatus::kOk,
+                              std::move(comments));
+    }
+
+    const auto body = ParseJsonObjectBody(request);
+    const auto text = GetRequiredStringMaxLength(body, "text", 2000);
+    const auto tags = GetOptionalStringArray(body, "tags");
+
+    const auto author = storage_.FindUserById(author_id);
+    if (!author.has_value()) {
+      throw ApiError{http::HttpStatus::kUnauthorized, "invalid bearer token"};
+    }
+
+    const auto comment = mongo_storage_.CreateTaskComment(
+        goal_id, task_id, *author, text, tags);
+    return MakeJsonResponse(request, http::HttpStatus::kCreated,
+                            BuildTaskComment(comment));
+  }
+};
+
+class TaskActivityHandler final : public ApiHandlerBase {
+ public:
+  static constexpr std::string_view kName = "handler-task-activity";
+  using ApiHandlerBase::ApiHandlerBase;
+
+ private:
+  std::string HandleApiRequest(
+      const http::HttpRequest& request,
+      server::request::RequestContext&) const override {
+    RequireAuth(request);
+
+    const auto goal_id = ParsePositiveId(request.GetPathArg("goalId"), "goalId");
+    const auto task_id = ParsePositiveId(request.GetPathArg("taskId"), "taskId");
+
+    if (!storage_.FindGoalById(goal_id).has_value()) {
+      throw ApiError{http::HttpStatus::kNotFound, "goal not found"};
+    }
+    if (!storage_.FindTask(goal_id, task_id).has_value()) {
+      throw ApiError{http::HttpStatus::kNotFound, "task not found"};
+    }
+
+    json::ValueBuilder activity(formats::common::Type::kArray);
+    for (const auto& event : mongo_storage_.ListTaskActivity(goal_id, task_id)) {
+      activity.PushBack(BuildTaskActivity(event));
+    }
+    return MakeJsonResponse(request, http::HttpStatus::kOk,
+                            std::move(activity));
   }
 };
 
@@ -795,8 +1164,11 @@ int main(int argc, char* argv[]) {
   const auto component_list =
       userver::components::MinimalServerComponentList()
           .Append<userver::components::TestsuiteSupport>()
+          .Append<userver::clients::dns::Component>()
           .Append<userver::components::Postgres>("task-planning-db")
+          .Append<userver::components::Mongo>("task-planning-mongo")
           .Append<task_planning::PostgresStorage>()
+          .Append<task_planning::MongoStorage>()
           .Append<task_planning::PingHandler>()
           .Append<task_planning::UsersHandler>()
           .Append<task_planning::LoginHandler>()
@@ -804,7 +1176,9 @@ int main(int argc, char* argv[]) {
           .Append<task_planning::UserSearchHandler>()
           .Append<task_planning::GoalsHandler>()
           .Append<task_planning::GoalTasksHandler>()
-          .Append<task_planning::TaskStatusHandler>();
+          .Append<task_planning::TaskStatusHandler>()
+          .Append<task_planning::TaskCommentsHandler>()
+          .Append<task_planning::TaskActivityHandler>();
 
   return userver::utils::DaemonMain(argc, argv, component_list);
 }

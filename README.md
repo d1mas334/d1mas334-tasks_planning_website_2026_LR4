@@ -1,4 +1,4 @@
-# Лабораторная работа 03. Проектирование и оптимизация реляционной базы данных
+# Лабораторная работа 04. Проектирование и работа с MongoDB
 
 ## Дисциплина
 
@@ -6,25 +6,31 @@
 
 ## Вариант
 
-Вариант 10 — планирование задач.
+Вариант 10 - планирование задач.
 
-Приложение содержит три основные сущности:
+Приложение содержит основные сущности:
 
 - пользователь;
 - цель;
 - задача.
 
-Лабораторная работа №3 продолжает REST API из лабораторной №2, но вместо in-memory storage использует PostgreSQL через компонент `userver::components::Postgres`.
+PostgreSQL из лабораторной работы 3 остается основным хранилищем для
+`users`, `goals` и `tasks`. MongoDB добавлена для документных данных:
+
+- история активности задач;
+- комментарии к задачам;
+- журнал уведомлений.
 
 ## Технологии
 
 - C++20;
 - Yandex Userver;
 - PostgreSQL 16;
-- REST API;
-- Docker и Docker Compose.
+- MongoDB 7;
+- Docker Compose;
+- REST API.
 
-MongoDB, Redis и RabbitMQ в этой лабораторной не используются.
+Redis и RabbitMQ в лабораторной работе 4 не используются.
 
 ## Структура проекта
 
@@ -39,77 +45,39 @@ MongoDB, Redis и RabbitMQ в этой лабораторной не испол�
 │   ├── schema.sql
 │   ├── data.sql
 │   └── queries.sql
+├── mongo/
+│   ├── validation.js
+│   ├── data.js
+│   └── queries.js
 ├── src/
 │   └── main.cpp
 ├── tests/
 │   └── curl_examples.md
+├── schema_design.md
 ├── optimization.md
 └── openapi.yaml
 ```
 
-## Схема БД
+## Хранилища данных
 
-Таблица `users`:
+PostgreSQL хранит нормализованные основные сущности:
 
-| Поле | Тип | Ограничения |
-|---|---|---|
-| `id` | `BIGSERIAL` | `PRIMARY KEY` |
-| `login` | `VARCHAR(64)` | `NOT NULL`, `UNIQUE` |
-| `password_hash` | `VARCHAR(255)` | `NOT NULL` |
-| `first_name` | `VARCHAR(100)` | `NOT NULL` |
-| `last_name` | `VARCHAR(100)` | `NOT NULL` |
-| `email` | `VARCHAR(255)` | `NOT NULL`, `UNIQUE` |
-| `phone` | `VARCHAR(32)` | nullable |
-| `role` | `VARCHAR(32)` | `NOT NULL`, `CHECK ('worker', 'manager', 'admin')` |
-| `created_at` | `TIMESTAMP` | `NOT NULL DEFAULT CURRENT_TIMESTAMP` |
+- `users` - пользователи и роли;
+- `goals` - цели;
+- `tasks` - задачи цели, исполнитель, автор, статус и срок.
 
-Таблица `goals`:
+MongoDB использует базу `task_planning_mongo` и коллекции:
 
-| Поле | Тип | Ограничения |
-|---|---|---|
-| `id` | `BIGSERIAL` | `PRIMARY KEY` |
-| `title` | `VARCHAR(255)` | `NOT NULL` |
-| `description` | `TEXT` | `NOT NULL` |
-| `author_id` | `BIGINT` | `NOT NULL`, `FOREIGN KEY users(id)` |
-| `status` | `VARCHAR(32)` | `NOT NULL DEFAULT 'active'`, `CHECK ('active', 'completed', 'cancelled')` |
-| `created_at` | `TIMESTAMP` | `NOT NULL DEFAULT CURRENT_TIMESTAMP` |
+- `task_activity` - события истории задачи;
+- `task_comments` - комментарии к задаче;
+- `notification_log` - журнал уведомлений.
 
-Таблица `tasks`:
-
-| Поле | Тип | Ограничения |
-|---|---|---|
-| `id` | `BIGSERIAL` | `PRIMARY KEY` |
-| `goal_id` | `BIGINT` | `NOT NULL`, `FOREIGN KEY goals(id) ON DELETE CASCADE` |
-| `title` | `VARCHAR(255)` | `NOT NULL` |
-| `description` | `TEXT` | `NOT NULL` |
-| `assignee_id` | `BIGINT` | `NOT NULL`, `FOREIGN KEY users(id)` |
-| `author_id` | `BIGINT` | `NOT NULL`, `FOREIGN KEY users(id)` |
-| `status` | `VARCHAR(32)` | `NOT NULL DEFAULT 'new'`, `CHECK ('new', 'in_progress', 'done', 'cancelled')` |
-| `due_date` | `DATE` | nullable |
-| `created_at` | `TIMESTAMP` | `NOT NULL DEFAULT CURRENT_TIMESTAMP` |
-| `updated_at` | `TIMESTAMP` | `NOT NULL DEFAULT CURRENT_TIMESTAMP` |
-
-DDL находится в [db/schema.sql](db/schema.sql), тестовые данные — в [db/data.sql](db/data.sql), SQL-шаблоны операций — в [db/queries.sql](db/queries.sql).
-
-## Индексы
-
-Созданы индексы:
-
-- `users.login` — через `UNIQUE`, быстрый поиск пользователя по логину;
-- `users.email` — через `UNIQUE`, контроль уникальности email;
-- `idx_goals_author_id` — ускоряет выборки целей по автору;
-- `idx_tasks_goal_id` — ускоряет получение задач цели;
-- `idx_tasks_assignee_id` — ускоряет выборки задач исполнителя;
-- `idx_tasks_author_id` — ускоряет выборки задач автора;
-- `idx_users_first_name_lower`, `idx_users_last_name_lower` — функциональные индексы для регистронезависимого поиска по имени и фамилии;
-- `idx_tasks_status`, `idx_goals_status` — фильтрация по статусам;
-- `idx_tasks_goal_id_status` — частый составной фильтр задач по цели и статусу.
-
-Подробности и планы запросов: [optimization.md](optimization.md).
+Подробное описание документной модели, выбора коллекций и решения
+embedded vs references находится в [schema_design.md](schema_design.md).
 
 ## Запуск
 
-Сборка и запуск API вместе с PostgreSQL:
+Собрать и запустить API, PostgreSQL и MongoDB:
 
 ```bash
 docker compose up --build
@@ -121,7 +89,86 @@ API доступен по адресу:
 http://localhost:8080
 ```
 
-PostgreSQL доступен внутри compose-сети как сервис `postgres`. Схема и тестовые данные автоматически подключаются через `/docker-entrypoint-initdb.d`.
+Если порт `8080` уже занят другим контейнером, можно выбрать другой host-порт:
+
+```bash
+API_PORT=18080 docker compose up --build
+```
+
+В PowerShell:
+
+```powershell
+$env:API_PORT = "18080"
+docker compose up --build
+```
+
+Тогда API будет доступен по адресу `http://localhost:18080`.
+
+MongoDB не публикует порт на host и доступна внутри compose-сети как сервис
+`mongo`. Скрипты из папки `mongo/` монтируются в контейнер по пути `/scripts`.
+
+## MongoDB scripts
+
+Создать коллекции, validators и индексы:
+
+```bash
+docker compose exec mongo mongosh /scripts/validation.js
+```
+
+Загрузить тестовые документы, по 10 документов в каждую коллекцию:
+
+```bash
+docker compose exec mongo mongosh /scripts/data.js
+```
+
+Выполнить CRUD-запросы и aggregation pipeline:
+
+```bash
+docker compose exec mongo mongosh /scripts/queries.js
+```
+
+`queries.js` содержит create/read/update/delete операции с операторами `$eq`,
+`$ne`, `$gt`, `$lt`, `$in`, `$and`, `$or`, `$addToSet`, `$pull`, а также
+aggregation pipeline с группировкой `task_activity` по `taskId` и `type`.
+
+## API endpoints
+
+Базовые endpoints PostgreSQL из лабораторной 3 сохранены:
+
+| Метод | URL | Назначение | Auth |
+|---|---|---|---|
+| GET | `/ping` | Проверка сервиса | Нет |
+| POST | `/api/users` | Создание пользователя | Нет |
+| POST | `/api/auth/login` | Получение bearer token | Нет |
+| GET | `/api/users/by-login?login=alexey` | Поиск пользователя по логину | Да |
+| GET | `/api/users/search?mask=iv` | Поиск пользователей по имени/фамилии | Да |
+| POST | `/api/goals` | Создание цели | Да |
+| GET | `/api/goals` | Получение целей | Да |
+| POST | `/api/goals/{goalId}/tasks` | Создание задачи в цели | Да |
+| GET | `/api/goals/{goalId}/tasks` | Получение задач цели | Да |
+| PATCH | `/api/goals/{goalId}/tasks/{taskId}/status` | Изменение статуса задачи | Да |
+
+Новые endpoints лабораторной 4:
+
+| Метод | URL | Назначение | Хранилище |
+|---|---|---|---|
+| POST | `/api/goals/{goalId}/tasks/{taskId}/comments` | Добавить комментарий к задаче | MongoDB |
+| GET | `/api/goals/{goalId}/tasks/{taskId}/comments` | Получить комментарии задачи | MongoDB |
+| GET | `/api/goals/{goalId}/tasks/{taskId}/activity` | Получить историю активности задачи | MongoDB |
+
+При успешном `PATCH /api/goals/{goalId}/tasks/{taskId}/status` API обновляет
+статус задачи в PostgreSQL и добавляет событие `status_changed` в MongoDB:
+
+```json
+{
+  "taskId": 1,
+  "goalId": 1,
+  "type": "status_changed",
+  "actor": { "userId": 1 },
+  "payload": { "newStatus": "in_progress" },
+  "createdAt": "2026-05-24T10:00:00Z"
+}
+```
 
 ## Проверка API
 
@@ -131,30 +178,7 @@ PostgreSQL доступен внутри compose-сети как сервис `p
 curl http://localhost:8080/ping
 ```
 
-Ожидаемый ответ:
-
-```json
-{"status":"ok"}
-```
-
-Создать пользователя:
-
-```bash
-LOGIN="ivan_$(date +%s)"
-curl -i -X POST http://localhost:8080/api/users \
-  -H "Content-Type: application/json" \
-  -d "{\"login\":\"$LOGIN\",\"password\":\"12345\",\"firstName\":\"Ivan\",\"lastName\":\"Ivanov\",\"email\":\"$LOGIN@example.com\",\"phone\":\"+79990000000\",\"role\":\"manager\"}"
-```
-
-Получить учебный bearer token:
-
-```bash
-curl -i -X POST http://localhost:8080/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d "{\"login\":\"$LOGIN\",\"password\":\"12345\"}"
-```
-
-Для быстрых ручных проверок можно использовать seed-пользователя:
+Получить учебный bearer token для seed-пользователя:
 
 ```bash
 TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
@@ -162,32 +186,30 @@ TOKEN=$(curl -s -X POST http://localhost:8080/api/auth/login \
   -d '{"login":"alexey","password":"pass123"}' | sed -E 's/.*"token":"([^"]+)".*/\1/')
 ```
 
-Создать цель:
-
-```bash
-curl -i -X POST http://localhost:8080/api/goals \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"title":"Сдать лабораторную №3","description":"Подключить PostgreSQL и описать оптимизацию"}'
-```
-
-Создать задачу:
-
-```bash
-curl -i -X POST http://localhost:8080/api/goals/1/tasks \
-  -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $TOKEN" \
-  -d '{"title":"Проверить PostgreSQL storage","description":"Убедиться, что API пишет в БД","assigneeId":1,"dueDate":"2026-06-01"}'
-```
-
-Получить задачи цели:
+Получить задачи цели из PostgreSQL:
 
 ```bash
 curl -i http://localhost:8080/api/goals/1/tasks \
   -H "Authorization: Bearer $TOKEN"
 ```
 
-Изменить статус задачи:
+Добавить комментарий к задаче в MongoDB:
+
+```bash
+curl -i -X POST http://localhost:8080/api/goals/1/tasks/1/comments \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $TOKEN" \
+  -d '{"text":"Комментарий из API лабораторной 4","tags":["api","mongo"]}'
+```
+
+Получить комментарии задачи:
+
+```bash
+curl -i http://localhost:8080/api/goals/1/tasks/1/comments \
+  -H "Authorization: Bearer $TOKEN"
+```
+
+Изменить статус задачи и записать событие в `task_activity`:
 
 ```bash
 curl -i -X PATCH http://localhost:8080/api/goals/1/tasks/1/status \
@@ -196,22 +218,14 @@ curl -i -X PATCH http://localhost:8080/api/goals/1/tasks/1/status \
   -d '{"status":"in_progress"}'
 ```
 
-## Endpoints
+Получить историю активности задачи:
 
-| Метод | URL | Назначение | Auth |
-|---|---|---|---|
-| GET | `/ping` | Проверка сервиса | Нет |
-| POST | `/api/users` | Создание пользователя | Нет |
-| POST | `/api/auth/login` | Получение bearer token | Нет |
-| GET | `/api/users/by-login?login=alexey` | Поиск пользователя по логину | Да |
-| GET | `/api/users/search?mask=iv` | Поиск пользователей по маске имени и фамилии | Да |
-| POST | `/api/goals` | Создание цели | Да |
-| GET | `/api/goals` | Получение всех целей | Да |
-| POST | `/api/goals/{goalId}/tasks` | Создание задачи в цели | Да |
-| GET | `/api/goals/{goalId}/tasks` | Получение задач цели | Да |
-| PATCH | `/api/goals/{goalId}/tasks/{taskId}/status` | Изменение статуса задачи | Да |
+```bash
+curl -i http://localhost:8080/api/goals/1/tasks/1/activity \
+  -H "Authorization: Bearer $TOKEN"
+```
 
-## SQL-проверки
+## PostgreSQL checks
 
 Открыть `psql` внутри контейнера:
 
@@ -232,12 +246,3 @@ docker compose exec -T postgres psql -U task_planning -d task_planning \
 docker compose exec -T postgres psql -U task_planning -d task_planning \
   -c "SELECT 'users' AS table_name, COUNT(*) FROM users UNION ALL SELECT 'goals', COUNT(*) FROM goals UNION ALL SELECT 'tasks', COUNT(*) FROM tasks;"
 ```
-
-Получить план запроса:
-
-```bash
-docker compose exec -T postgres psql -U task_planning -d task_planning \
-  -c "EXPLAIN (ANALYZE, BUFFERS) SELECT * FROM tasks WHERE goal_id = 1 ORDER BY id;"
-```
-
-Файл [db/queries.sql](db/queries.sql) содержит шаблоны SQL-запросов с параметрами `$1`, `$2`, `$3`, которые использует API-код.

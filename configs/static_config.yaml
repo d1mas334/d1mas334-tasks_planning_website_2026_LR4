@@ -20,6 +20,8 @@ components_manager:
           level: info
           overflow_behavior: discard
 
+    dns-client: {}
+
     task-planning-db:
       dbconnection: 'postgresql://task_planning:task_planning@postgres:5432/task_planning'
       blocking_task_processor: fs-task-processor
@@ -28,7 +30,23 @@ components_manager:
       max_pool_size: 5
       max_queue_size: 200
 
+    task-planning-mongo:
+      dbconnection: 'mongodb://mongo:27017/task_planning_mongo'
+      appname: task-planning-api
+      conn_timeout: 2s
+      so_timeout: 10s
+      queue_timeout: 1s
+      initial_size: 2
+      max_size: 10
+      idle_limit: 5
+      connecting_limit: 2
+      local_threshold: 15ms
+      maintenance_period: 15s
+      stats_verbosity: terse
+
     postgres-storage: {}
+
+    mongo-storage: {}
 
     testsuite-support: {}
 
@@ -70,6 +88,16 @@ components_manager:
     handler-task-status:
       path: /api/goals/{goalId}/tasks/{taskId}/status
       method: PATCH
+      task_processor: main-task-processor
+
+    handler-task-comments:
+      path: /api/goals/{goalId}/tasks/{taskId}/comments
+      method: GET,POST
+      task_processor: main-task-processor
+
+    handler-task-activity:
+      path: /api/goals/{goalId}/tasks/{taskId}/activity
+      method: GET
       task_processor: main-task-processor
 
     dynamic-config:
