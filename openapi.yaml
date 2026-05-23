@@ -195,6 +195,7 @@ paths:
   /api/goals/{goalId}/tasks/{taskId}/status:
     patch:
       summary: Change task status
+      description: Updates task status in PostgreSQL and writes a status_changed event to MongoDB task_activity.
       parameters:
         - name: goalId
           in: path
@@ -223,6 +224,96 @@ paths:
             application/json:
               schema:
                 $ref: '#/components/schemas/Task'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/goals/{goalId}/tasks/{taskId}/comments:
+    parameters:
+      - name: goalId
+        in: path
+        required: true
+        schema:
+          type: integer
+          minimum: 1
+        example: 1
+      - name: taskId
+        in: path
+        required: true
+        schema:
+          type: integer
+          minimum: 1
+        example: 1
+    post:
+      summary: Add a comment to a task
+      description: Stores a task comment document in MongoDB task_comments.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateTaskCommentRequest'
+      responses:
+        '201':
+          description: Comment created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TaskComment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+    get:
+      summary: List task comments
+      description: Returns comments for a task from MongoDB task_comments sorted by creation time.
+      responses:
+        '200':
+          description: Task comments
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TaskComment'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+  /api/goals/{goalId}/tasks/{taskId}/activity:
+    get:
+      summary: List task activity history
+      description: Returns activity events for a task from MongoDB task_activity sorted by creation time.
+      parameters:
+        - name: goalId
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+          example: 1
+        - name: taskId
+          in: path
+          required: true
+          schema:
+            type: integer
+            minimum: 1
+          example: 1
+      responses:
+        '200':
+          description: Task activity events
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/TaskActivity'
         '400':
           $ref: '#/components/responses/BadRequest'
         '401':
@@ -421,3 +512,101 @@ components:
           type: string
           enum: [new, in_progress, done, cancelled]
           example: in_progress
+    CreateTaskCommentRequest:
+      type: object
+      required: [text]
+      properties:
+        text:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          example: API comment from MongoDB endpoint
+        tags:
+          type: array
+          items:
+            type: string
+          example: [api, mongo]
+    EmbeddedUser:
+      type: object
+      required: [userId, login, displayName]
+      properties:
+        userId:
+          type: integer
+          example: 1
+        login:
+          type: string
+          example: alexey
+        displayName:
+          type: string
+          example: Alexey Sokolov
+    TaskComment:
+      type: object
+      required: [id, taskId, goalId, author, text, tags, createdAt, updatedAt]
+      properties:
+        id:
+          type: string
+          description: MongoDB ObjectId as hex string
+          example: 6651f9a7d4f1f3c4a7b8c901
+        taskId:
+          type: integer
+          example: 1
+        goalId:
+          type: integer
+          example: 1
+        author:
+          $ref: '#/components/schemas/EmbeddedUser'
+        text:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          example: API comment from MongoDB endpoint
+        tags:
+          type: array
+          items:
+            type: string
+          example: [api, mongo]
+        createdAt:
+          type: string
+          format: date-time
+          example: '2026-05-24T10:00:00Z'
+        updatedAt:
+          type: string
+          format: date-time
+          example: '2026-05-24T10:00:00Z'
+    TaskActivity:
+      type: object
+      required: [id, taskId, goalId, type, actor, payload, visibleTo, important, createdAt]
+      properties:
+        id:
+          type: string
+          description: MongoDB ObjectId as hex string
+          example: 6651fa02d4f1f3c4a7b8c902
+        taskId:
+          type: integer
+          example: 1
+        goalId:
+          type: integer
+          example: 1
+        type:
+          type: string
+          enum: [task_created, status_changed, assignee_changed, comment_added, deadline_changed]
+          example: status_changed
+        actor:
+          $ref: '#/components/schemas/EmbeddedUser'
+        payload:
+          type: object
+          additionalProperties: true
+          example:
+            newStatus: in_progress
+        visibleTo:
+          type: array
+          items:
+            type: integer
+          example: [1, 2]
+        important:
+          type: boolean
+          example: true
+        createdAt:
+          type: string
+          format: date-time
+          example: '2026-05-24T10:00:00Z'
